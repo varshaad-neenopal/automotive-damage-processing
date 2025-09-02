@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pillow
+boto3
+botocore
+python-multipart
+pandas
+numpy
