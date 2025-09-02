@@ -1,0 +1,337 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Full-stack ECS Fargate deployment for React frontend + FastAPI backend
+
+Parameters:
+  BackendImage:
+    Type: String
+    Description: ECR URI for backend Docker image
+  FrontendImage:
+    Type: String
+    Description: ECR URI for frontend Docker image
+
+Resources:
+
+  #########################
+  # VPC + Networking
+  #########################
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: fullstack-vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-subnet-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: fullstack-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  #########################
+  # CloudWatch Log Groups
+  #########################
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/backend
+      RetentionInDays: 14
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/frontend
+      RetentionInDays: 14
+
+  #########################
+  # Security Groups
+  #########################
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: alb-sg
+
+  BackendSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend ECS SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: backend-sg
+
+  FrontendSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Frontend ECS SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: frontend-sg
+
+  #########################
+  # Load Balancer
+  #########################
+
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: fullstack-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: 404
+            ContentType: text/plain
+            MessageBody: Not Found
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: backend-tg
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /docs
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: frontend-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /index.html
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /api/*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  FrontendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /*
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  #########################
+  # ECS Cluster
+  #########################
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: fullstack-cluster
+
+  #########################
+  # ECS Task Definitions
+  #########################
+
+  BackendTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: my-backend-task
+      Cpu: 512
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: arn:aws:iam::654654399581:role/ecsTaskExecutionRole
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings:
+            - ContainerPort: 8000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: backend
+
+  FrontendTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: my-frontend-task
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: arn:aws:iam::654654399581:role/ecsTaskExecutionRole
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImage
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: frontend
+
+  #########################
+  # ECS Services
+  #########################
+
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - BackendTask
+      - BackendListenerRule
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref BackendTask
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref BackendSG
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8000
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: FrontendListenerRule
+    Properties:
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref FrontendTask
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref FrontendSG
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 80
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+Outputs:
+  ALBDNS:
+    Description: ALB DNS Name
+    Value: !GetAtt AppLoadBalancer.DNSName
